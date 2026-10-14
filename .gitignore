@@ -1,0 +1,9 @@
+# Video files (exceed GitHub 100MB file limit)
+*.mkv
+
+# Archives & temporary directories
+.archive/
+.agents/
+.aws/
+.codex/
+
