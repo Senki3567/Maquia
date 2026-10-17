@@ -22,9 +22,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-SOURCE_CSV = ROOT / "Maquia WIP.csv"
+SOURCE_CSV = ROOT / "Maquia WIP.nguon-gon.csv"
 COMPACT_CSV = ROOT / "Maquia WIP.gon.csv"
 MANIFEST = ROOT / "Maquia WIP.gon.map.json"
+ACTOR_NOTES = ROOT / "Maquia WIP.actor-notes.json"
 VI_ASS = ROOT / "Maquia.vi.ass"
 FROM_JP_ASS = ROOT / "Maquia.vi.from-jp.ass"
 JP_ASS = ROOT / "Maquia.ass"
@@ -39,6 +40,7 @@ HEADER = [
     "Việt dịch từ Nhật",
     "Việt gốc (sửa cột này)",
     "Ghi chú đối chiếu Nhật",
+    "Ghi chú Actor (chỉ để kiểm tra)",
 ]
 NOTE_ID = re.compile(r"^\{(\d{4})\}\s*(.*)$", re.DOTALL)
 REPEAT = re.compile(r"GIỮ LẶP/LAYER ×(\d+)")
@@ -96,7 +98,7 @@ def split_ending(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def read_ass(path: Path) -> AssFile:
+def read_ass(path: Path, *, include_comments: bool = False) -> AssFile:
     raw = path.read_bytes()
     bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
     lines = raw[len(bom):].decode("utf-8").splitlines(keepends=True)
@@ -115,12 +117,13 @@ def read_ass(path: Path) -> AssFile:
             event_format = [part.strip() for part in stripped[7:].split(",")]
             if event_format != EVENT_FORMAT:
                 fail(f"Format Events không hỗ trợ trong {path.name}: {event_format}")
-        elif body.startswith("Dialogue:"):
+        elif body.startswith("Dialogue:") or (include_comments and body.startswith("Comment:")):
             if not event_format:
-                fail(f"Dialogue đứng trước Format trong {path.name}")
-            values = body[len("Dialogue:"):].lstrip().split(",", len(event_format) - 1)
+                fail(f"Event đứng trước Format trong {path.name}")
+            event_type = "Comment:" if body.startswith("Comment:") else "Dialogue:"
+            values = body[len(event_type):].lstrip().split(",", len(event_format) - 1)
             if len(values) != len(event_format):
-                fail(f"Dialogue hỏng ở dòng vật lý {line_index + 1} của {path.name}")
+                fail(f"Event hỏng ở dòng vật lý {line_index + 1} của {path.name}")
             dialogue.append(AssEvent(line_index, dict(zip(event_format, values))))
     return AssFile(raw, bom, lines, dialogue)
 
@@ -136,11 +139,11 @@ def prefix_and_visible(text: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
-def note_parts(value: str, row_number: int) -> tuple[str, str]:
+def note_parts(value: str, row_number: int) -> tuple[int, str]:
     match = NOTE_ID.fullmatch(value)
-    if not match or int(match.group(1)) != row_number:
-        fail(f"Mã note không khớp dòng CSV {row_number}")
-    return match.group(1), match.group(2)
+    if not match:
+        fail(f"Mã note không hợp lệ ở dòng CSV {row_number}")
+    return int(match.group(1)), match.group(2)
 
 
 def validate_sources(rows: list[list[str]], vi: AssFile, direct: AssFile,
@@ -148,19 +151,22 @@ def validate_sources(rows: list[list[str]], vi: AssFile, direct: AssFile,
     if not rows or any(len(row) != 5 for row in rows):
         fail("CSV gốc phải có đúng 5 cột ở mọi hàng")
     count = len(rows)
-    for name, ass in (("Việt", vi), ("dịch từ Nhật", direct), ("Nhật", japanese)):
-        if len(ass.dialogue) < count:
-            fail(f"ASS {name} có ít hơn {count} dòng Dialogue")
+    if len(vi.dialogue) < count:
+        fail(f"ASS Việt có ít hơn {count} dòng Dialogue/Comment")
 
     notes: list[str] = []
     keys: list[tuple[str, ...]] = []
     fallback_rows: list[int] = []
+    previous_id = 0
     for index, row in enumerate(rows):
         number = index + 1
-        _, note = note_parts(row[4], number)
+        source_id, note = note_parts(row[4], number)
+        if source_id <= previous_id or source_id > len(direct.dialogue) or source_id > len(japanese.dialogue):
+            fail(f"Mã note không tăng hoặc vượt ASS tham chiếu ở dòng CSV {number}")
+        previous_id = source_id
         a = vi.dialogue[index].fields
-        b = direct.dialogue[index].fields
-        j = japanese.dialogue[index].fields
+        b = direct.dialogue[source_id - 1].fields
+        j = japanese.dialogue[source_id - 1].fields
         if row[0] != a["Effect"] or row[1] != a["Name"]:
             fail(f"Effect/Name ở dòng {number} không khớp ASS Việt")
         if row[2] != visible(b["Text"]):
@@ -233,22 +239,29 @@ def build() -> None:
     if COMPACT_CSV.exists() or MANIFEST.exists():
         fail("CSV gọn hoặc map đã có; không ghi đè bản người dùng có thể đã sửa")
     rows = read_csv(SOURCE_CSV)
-    vi, direct, japanese = (read_ass(path) for path in (VI_ASS, FROM_JP_ASS, JP_ASS))
+    vi = read_ass(VI_ASS, include_comments=True)
+    direct, japanese = (read_ass(path) for path in (FROM_JP_ASS, JP_ASS))
     notes, keys, fallback_rows = validate_sources(rows, vi, direct, japanese)
     groups, unmerged_flags = make_groups(rows, keys)
+    actor_notes = json.loads(ACTOR_NOTES.read_text(encoding="utf-8"))
+    source_ids = [note_parts(row[4], i + 1)[0] for i, row in enumerate(rows)]
     compact = [HEADER]
     for group in groups:
         first = group[0] - 1
         row = rows[first]
+        group_notes = list(dict.fromkeys(actor_notes.get(str(source_ids[item - 1]), "")
+                                          for item in group))
         compact.append([
-            " ".join(f"{item:04d}" for item in group),
+            " ".join(f"{source_ids[item - 1]:04d}" for item in group),
             str(len(group)), row[0], row[1], row[2], row[3], notes[first],
+            " | ".join(item for item in group_notes if item),
         ])
     manifest = {
         "version": 1,
         "source_hashes": source_hashes(),
         "source_rows": len(rows),
         "groups": groups,
+        "source_ids": source_ids,
         "fallback_rows": fallback_rows,
         "unmerged_flags": unmerged_flags,
     }
@@ -262,7 +275,7 @@ def build() -> None:
     print(f"Giữ riêng hai cặp khác người nói ở dòng {', '.join(map(str, unmerged_flags))}.")
 
 
-def load_edited(compact_path: Path) -> tuple[list[list[str]], list[list[str]], dict, int]:
+def load_edited(compact_path: Path) -> tuple[list[list[str]], list[list[str]], dict, int, set[int]]:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     if manifest.get("version") != 1:
         fail("Phiên bản map không hỗ trợ")
@@ -277,18 +290,24 @@ def load_edited(compact_path: Path) -> tuple[list[list[str]], list[list[str]], d
     if not compact or compact[0] != HEADER:
         fail("Tiêu đề CSV gọn đã đổi")
     if any(len(row) != len(HEADER) for row in compact):
-        fail("Có hàng CSV gọn không đủ 7 cột")
-    expected_groups = {tuple(group) for group in manifest["groups"]}
+        fail("Có hàng CSV gọn không đủ 8 cột")
+    display_to_group = {
+        tuple(manifest["source_ids"][item - 1] for item in group): tuple(group)
+        for group in manifest["groups"]
+    }
+    expected_groups = set(display_to_group.values())
     if len(compact) - 1 != len(expected_groups):
         fail("Số nhóm trong CSV gọn đã đổi")
     seen: set[tuple[int, ...]] = set()
     expanded = [row.copy() for row in source_rows]
     edited_groups = 0
+    edited_rows: set[int] = set()
     for row in compact[1:]:
         try:
-            group = tuple(int(item) for item in row[0].split())
+            display_ids = tuple(int(item) for item in row[0].split())
         except ValueError:
             fail(f"Mã dòng nguồn không hợp lệ: {row[0]!r}")
+        group = display_to_group.get(display_ids)
         if group not in expected_groups or group in seen:
             fail(f"Nhóm dòng nguồn bị đổi hoặc lặp: {row[0]!r}")
         seen.add(group)
@@ -297,7 +316,7 @@ def load_edited(compact_path: Path) -> tuple[list[list[str]], list[list[str]], d
         if row[1] != str(len(group)) or [row[2], row[3], row[4], row[6]] != [
             original[0], original[1], original[2], note,
         ]:
-            fail(f"Cột tham chiếu của nhóm {row[0]} đã đổi; chỉ sửa cột Việt gốc")
+            fail(f"Cột tham chiếu của nhóm {row[0]} đã đổi; chỉ sửa cột Việt gốc hoặc ghi chú Actor")
         new_text = row[5]
         if "\r" in new_text or "\n" in new_text:
             fail(f"Nhóm {row[0]} có xuống dòng thật; dùng ký hiệu ASS \\N")
@@ -305,17 +324,20 @@ def load_edited(compact_path: Path) -> tuple[list[list[str]], list[list[str]], d
             fail(f"Nhóm {row[0]} chứa ngoặc tag ASS trong cột Việt gốc")
         if new_text != original[3]:
             edited_groups += 1
+            edited_rows.update(group)
         for number in group:
             expanded[number - 1][3] = new_text
     if seen != expected_groups:
         fail("CSV gọn thiếu nhóm")
-    return source_rows, expanded, manifest, edited_groups
+    return source_rows, expanded, manifest, edited_groups, edited_rows
 
 
-def patch_ass(vi: AssFile, expanded: list[list[str]]) -> tuple[bytes, int]:
+def patch_ass(vi: AssFile, expanded: list[list[str]], edited_rows: set[int]) -> tuple[bytes, int]:
     lines = vi.lines.copy()
     changed = 0
-    for index, row in enumerate(expanded):
+    for number in sorted(edited_rows):
+        index = number - 1
+        row = expanded[index]
         event = vi.dialogue[index]
         original_text = event.fields["Text"]
         prefix, old_visible = prefix_and_visible(original_text)
@@ -325,7 +347,7 @@ def patch_ass(vi: AssFile, expanded: list[list[str]]) -> tuple[bytes, int]:
         raw_line, ending = split_ending(lines[event.line_index])
         parts = raw_line.split(",", len(EVENT_FORMAT) - 1)
         if len(parts) != len(EVENT_FORMAT) or parts[-1] != original_text:
-            fail(f"Không thể giữ nguyên trường ASS ở Dialogue {index + 1}")
+            fail(f"Không thể giữ nguyên trường ASS ở event {index + 1}")
         lines[event.line_index] = ",".join(parts[:-1]) + "," + prefix + new_visible + ending
         changed += 1
     output = vi.bom + "".join(lines).encode("utf-8")
@@ -342,7 +364,7 @@ def export(compact_path: Path, full_path: Path, ass_path: Path, *, force: bool) 
         fail("Hai đầu ra phải khác nhau")
     if not force and (full_path.exists() or ass_path.exists()):
         fail("Đầu ra đã tồn tại; dùng --force nếu muốn tạo lại")
-    source_rows, expanded, manifest, edited_groups = load_edited(compact_path)
+    source_rows, expanded, manifest, edited_groups, edited_rows = load_edited(compact_path)
     source_raw = SOURCE_CSV.read_bytes()
     if expanded == source_rows:
         full_data = source_raw
@@ -350,14 +372,13 @@ def export(compact_path: Path, full_path: Path, ass_path: Path, *, force: bool) 
         newline = "\r\n" if b"\r\n" in source_raw else "\n"
         full_data = csv_bytes(expanded, bom=source_raw.startswith(b"\xef\xbb\xbf"),
                               newline=newline, final_newline=source_raw.endswith(b"\n"))
-    vi = read_ass(VI_ASS)
-    ass_data, changed_events = patch_ass(vi, expanded)
+    vi = read_ass(VI_ASS, include_comments=True)
+    ass_data, changed_events = patch_ass(vi, expanded, edited_rows)
     write_file(full_path, full_data, force=force)
     write_file(ass_path, ass_data, force=force)
     print(f"Đã bung {len(expanded)} dòng vào {full_path}")
     print(f"Đã tạo {ass_path}: {changed_events} Text đổi; {edited_groups} nhóm được sửa "
-          f"trong CSV gọn; {len(manifest['fallback_rows'])} dòng nguồn Việt trống "
-          "sẽ nhận lời trong CSV.")
+          "trong CSV gọn. Các dòng chưa sửa giữ nguyên Text trong ASS.")
 
 
 def main() -> None:
